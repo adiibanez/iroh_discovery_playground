@@ -1,16 +1,17 @@
-// use objc2::runtime::message_receiver::MessageReceiver;
 use objc2::{MainThreadMarker, class, msg_send, rc::Retained, sel};
 use objc2_foundation::NSString;
 use objc2_multipeer_connectivity::{
     MCAdvertiserAssistant, MCBrowserViewController, MCPeerID, MCSession,
 };
 
+use objc2::AllocAnyThread;
+use objc2::MainThreadOnly;
+
 use std::sync::{Arc, RwLock};
 
 #[derive(Debug)]
 pub struct MultipeerTransport {
-    // pub peer_id: MCPeerID, // Represents the peer’s unique identifier
-    pub peer_id: Retained<MCPeerID>,
+    pub peer_id: Retained<MCPeerID>, // Changed from MCPeerID to Retained<MCPeerID>
     pub session: Option<Retained<MCSession>>, // Communication session with peers
     pub advertiser: Option<Retained<MCAdvertiserAssistant>>, // Advertise to nearby peers
     pub browser: Option<Retained<MCBrowserViewController>>, // Browse for available peers
@@ -20,23 +21,54 @@ impl MultipeerTransport {
     // Start advertising this peer to nearby devices
     pub fn start_advertising(&mut self, service_type: &str) {
         unsafe {
-            // The `new()` method requires unsafe because we are interacting with raw Objective-C API
-            let advertiser = MCAdvertiserAssistant::new(); // Create advertiser
+            // Convert service_type to NSString with proper format
+            // Format must be: up to 15 characters long and contain only letters, numbers, and hyphens
+            let formatted_type = format!("iroh-{}", service_type)
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+                .take(15)
+                .collect::<String>();
+
+            let service_type = NSString::from_str(&formatted_type);
+
+            // Initialize advertiser with proper parameters
+            let advertiser = MCAdvertiserAssistant::initWithServiceType_discoveryInfo_session(
+                MCAdvertiserAssistant::alloc(),
+                &service_type,
+                None, // No discovery info
+                self.session.as_ref().unwrap().as_ref(),
+            );
+
             self.advertiser = Some(advertiser);
-            // Configure advertiser with service type
+
+            // Start advertising
             let _: () = msg_send![self.advertiser.as_ref().unwrap(), start];
         }
     }
 
-    // Start browsing for other peers
     pub fn start_browsing(&mut self, service_type: &str) {
         unsafe {
-            // Create the browser on the main thread
-            // The `MainThreadMarker` is used to indicate this must be executed on the main thread
-            let main_thread_marker = MainThreadMarker::new().unwrap();
-            let browser = MCBrowserViewController::new(main_thread_marker); // Correct use
+            // Convert service_type to NSString
+            let formatted_type = format!("iroh-{}", service_type)
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+                .take(15)
+                .collect::<String>();
+
+            let service_type = NSString::from_str(&formatted_type);
+
+            let mainthread_marker = unsafe { MainThreadMarker::new_unchecked() };
+
+            // Initialize browser with proper parameters
+            let browser = MCBrowserViewController::initWithServiceType_session(
+                MCBrowserViewController::alloc(mainthread_marker),
+                &service_type,
+                self.session.as_ref().unwrap().as_ref(),
+            );
+
             self.browser = Some(browser);
-            // Start browsing for peers
+
+            // Start browsing
             let _: () = msg_send![self.browser.as_ref().unwrap(), start];
         }
     }
@@ -44,10 +76,9 @@ impl MultipeerTransport {
     // Establish a communication session
     pub fn establish_connection(&mut self) {
         unsafe {
-            // The `new()` method for `MCSession` also requires unsafe since it interacts with Objective-C API
-            let session = MCSession::new(); // Create session without peer_id
+            // Initialize MCSession with our peer_id
+            let session = MCSession::initWithPeer(MCSession::alloc(), self.peer_id.as_ref());
             self.session = Some(session);
-            // Additional session configuration (if any) can go here
         }
     }
 
