@@ -7,3 +7,4 @@ edition = "2024"
 objc2 = { version = "0.6.0", features = ["exception"] }
 objc2-foundation = "0.3.0"
 objc2-multipeer-connectivity = "0.3.0"
+rand = "0.8.0"
