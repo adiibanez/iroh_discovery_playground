@@ -1,15 +1,18 @@
 use iroh_mpc_discovery::MultipeerTransport;
 use objc2::AllocAnyThread;
-use objc2::{MainThreadMarker, exception, rc::Retained};
+use objc2::{MainThreadMarker, exception};
 use objc2_foundation::NSString;
-use objc2_multipeer_connectivity::{MCPeerID, MCSession};
+use objc2_multipeer_connectivity::MCPeerID;
 use std::io::Error;
 
-use rand::distributions::Alphanumeric;
-use rand::{Rng, thread_rng};
+use env_logger::{Builder, Env};
 
 fn main() {
     println!("Hello, world!");
+
+    Builder::from_env(Env::default().default_filter_or("debug"))
+        .format_timestamp_millis()
+        .init();
 
     match exception::catch(|| {
         let main_thread = unsafe { MainThreadMarker::new_unchecked() };
