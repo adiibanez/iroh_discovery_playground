@@ -1,0 +1,9 @@
+[package]
+name = "iroh_mpc_discovery"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+objc2 = { version = "0.6.0" }
+objc2-foundation = "0.3.0"
+objc2-multipeer-connectivity = "0.3.0"
