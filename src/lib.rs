@@ -149,7 +149,7 @@ impl MultipeerTransport {
             let delegate_ptr = Box::into_raw(delegate_box);
 
             // Create retained object and protocol object
-            let retained = Retained::new(delegate_ptr).expect("Failed to retain delegate");
+            let retained = Retained::from_raw(delegate_ptr).expect("Failed to retain delegate");
             let delegate_object = ProtocolObject::from_retained(retained);
 
             // Initialize MCSession with our peer_id

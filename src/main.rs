@@ -27,19 +27,19 @@ fn main() {
         };*/
 
         transport.establish_connection();
-        transport.start_advertising("mpcservice");
-        transport.start_browsing("mpcservice");
+        // transport.start_advertising("mpcservice");
+        // transport.start_browsing("mpcservice");
 
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        // std::thread::sleep(std::time::Duration::from_secs(2));
 
-        let random_message: String = thread_rng()
-            .sample_iter(&Alphanumeric)
-            .take(10)
-            .map(char::from)
-            .collect();
+        // let random_message: String = thread_rng()
+        //     .sample_iter(&Alphanumeric)
+        //     .take(10)
+        //     .map(char::from)
+        //     .collect();
 
-        transport.send_message(&random_message);
-        println!("Sent random message: {}", random_message);
+        // transport.send_message(&random_message);
+        // println!("Sent random message: {}", random_message);
 
         Ok::<MultipeerTransport, Error>(transport)
     }) {
