@@ -1,13 +1,40 @@
-use iroh_mpc_discovery::MultipeerTransport;
+#![allow(unused_imports)]
+#![allow(dead_code)]
+#![allow(unused_variables)]
+// #![allow(deprecated)]
+// #![allow(unused_must_use)]
+#![allow(non_local_definitions)]
+// #[cfg(not(clippy))]
+#![feature(mpmc_channel)]
+#![allow(clippy::too_many_arguments)]
+
+use iroh_discovery_playground::MultipeerTransport;
+use multipeer_session::MultipeerSession;
 use objc2::AllocAnyThread;
 use objc2::{MainThreadMarker, exception};
 use objc2_foundation::NSString;
 use objc2_multipeer_connectivity::MCPeerID;
 use std::io::Error;
 
+mod multipeer_session;
+
 use env_logger::{Builder, Env};
 
 fn main() {
+    let session = MultipeerSession::new(
+        "example-service",
+        |data, peer| println!("Received data from peer: {:?}", peer),
+        |peer| println!("Peer joined: {:?}", peer),
+        |peer| println!("Peer left: {:?}", peer),
+    );
+
+    // Send data to peers
+    if let Ok(()) = session.send_to_peers(b"Hello!", &session.connected_peers(), true) {
+        println!("Message sent successfully");
+    }
+}
+
+fn main_() {
     println!("Hello, world!");
 
     Builder::from_env(Env::default().default_filter_or("debug"))

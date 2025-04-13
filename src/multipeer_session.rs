@@ -1,0 +1,299 @@
+#![allow(unused_unsafe)]
+use objc2::rc::Allocated;
+use objc2::{Encoding, Message, RefEncode};
+use objc2::{MainThreadMarker, class, msg_send, rc::Retained, sel};
+use objc2_foundation::{NSAutoreleasePool, NSData, NSError, NSURL};
+use objc2_foundation::{NSInputStream, NSObjectProtocol};
+use objc2_foundation::{NSProgress, NSString};
+use objc2_multipeer_connectivity::MCSessionSendDataMode;
+use objc2_multipeer_connectivity::MCSessionState;
+use objc2_multipeer_connectivity::{
+    MCAdvertiserAssistant, MCBrowserViewController, MCPeerID, MCSession,
+};
+use objc2_multipeer_connectivity::{
+    MCNearbyServiceAdvertiser, MCNearbyServiceBrowser, MCSessionDelegate,
+};
+
+use objc2_foundation::NSArray;
+
+use objc2::runtime::ProtocolObject;
+use objc2::runtime::{AnyClass, AnyObject};
+// use objc2::{Encoding, Message, RefEncode, class};
+
+use objc2::AllocAnyThread;
+use objc2::MainThreadOnly;
+
+use std::fmt;
+use std::marker::PhantomData;
+use std::sync::{Arc, RwLock};
+
+use log::{debug, error, info, trace, warn};
+
+// #[derive(Debug)]
+pub struct MultipeerSession {
+    service_type: Retained<NSString>,
+    peer_id: Retained<MCPeerID>,
+    session: Option<Retained<MCSession>>,
+    service_advertiser: Option<Retained<MCNearbyServiceAdvertiser>>,
+    service_browser: Option<Retained<MCNearbyServiceBrowser>>,
+    delegate: Option<Retained<ProtocolObject<dyn MCSessionDelegate>>>,
+    #[doc(hidden)]
+    on_peer_joined: Option<Box<dyn Fn(&MCPeerID)>>,
+    #[doc(hidden)]
+    on_peer_left: Option<Box<dyn Fn(&MCPeerID)>>,
+    #[doc(hidden)]
+    on_data_received: Option<Box<dyn Fn(&NSData, &MCPeerID)>>,
+}
+
+// Manual Debug implementation to skip the callback fields
+impl fmt::Debug for MultipeerSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MultipeerSession")
+            .field("service_type", &self.service_type)
+            .field("peer_id", &self.peer_id)
+            .field("session", &self.session)
+            .field("service_advertiser", &self.service_advertiser)
+            .field("service_browser", &self.service_browser)
+            .field("delegate", &self.delegate)
+            // Skip the callback fields
+            .finish()
+    }
+}
+
+impl MultipeerSession {
+    pub fn new(
+        service_name: &str,
+        on_data: impl Fn(&NSData, &MCPeerID) + 'static,
+        on_joined: impl Fn(&MCPeerID) + 'static,
+        on_left: impl Fn(&MCPeerID) + 'static,
+    ) -> Self {
+        unsafe {
+            let _pool = unsafe { NSAutoreleasePool::new() };
+
+            // Format service name
+            let formatted_name = format!("iroh-{}", service_name)
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+                .take(15)
+                .collect::<String>();
+
+            let service_type = NSString::from_str(&formatted_name);
+
+            // Create peer ID from device name
+            let device_name = NSString::from_str("rust-peer"); // TODO: Get actual device name
+            let peer_id = MCPeerID::initWithDisplayName(MCPeerID::alloc(), &device_name);
+
+            let mut session = Self {
+                service_type,
+                peer_id,
+                session: None,
+                service_advertiser: None,
+                service_browser: None,
+                delegate: None,
+                on_peer_joined: Some(Box::new(on_joined)),
+                on_peer_left: Some(Box::new(on_left)),
+                on_data_received: Some(Box::new(on_data)),
+            };
+
+            // Initialize session
+            session.initialize();
+            session
+        }
+    }
+
+    fn initialize(&mut self) {
+        unsafe {
+            let _pool = unsafe { NSAutoreleasePool::new() };
+
+            // Create MCSession
+            let mc_session = MCSession::initWithPeer(MCSession::alloc(), self.peer_id.as_ref());
+
+            // Create and set delegate
+            let delegate = SessionDelegate::new(
+                self.on_data_received.take(),
+                self.on_peer_joined.take(),
+                self.on_peer_left.take(),
+            );
+
+            let retained = {
+                // Box the delegate first
+                let boxed = Box::new(delegate);
+                // Convert to raw pointer
+                let raw_ptr = Box::into_raw(boxed);
+                // Create retained object from raw pointer
+                Retained::from_raw(raw_ptr).expect("Failed to retain delegate")
+            };
+
+            let proto_obj = ProtocolObject::from_retained(retained);
+
+            mc_session.setDelegate(Some(&proto_obj));
+            self.delegate = Some(proto_obj);
+            self.session = Some(mc_session);
+
+            // Setup advertiser
+            let advertiser = MCNearbyServiceAdvertiser::initWithPeer_discoveryInfo_serviceType(
+                MCNearbyServiceAdvertiser::alloc(),
+                self.peer_id.as_ref(),
+                None,
+                self.service_type.as_ref(),
+            );
+            advertiser.startAdvertisingPeer();
+            self.service_advertiser = Some(advertiser);
+
+            // Setup browser
+            let browser = MCNearbyServiceBrowser::initWithPeer_serviceType(
+                MCNearbyServiceBrowser::alloc(),
+                self.peer_id.as_ref(),
+                self.service_type.as_ref(),
+            );
+            browser.startBrowsingForPeers();
+            self.service_browser = Some(browser);
+        }
+    }
+
+    pub fn send_to_peers(
+        &self,
+        data: &[u8],
+        peers: &[Retained<MCPeerID>], // Changed parameter type
+        reliably: bool,
+    ) -> Result<(), String> {
+        if let Some(session) = &self.session {
+            unsafe {
+                let ns_data = NSData::from_vec(data.to_vec());
+
+                let _pool = unsafe { NSAutoreleasePool::new() };
+
+                // Convert peers to references
+                let peer_refs: Vec<&MCPeerID> = peers.iter().map(|p| p.as_ref()).collect();
+                let peer_array = NSArray::from_slice(&peer_refs);
+
+                let mode = if reliably {
+                    MCSessionSendDataMode::Reliable
+                } else {
+                    MCSessionSendDataMode::Unreliable
+                };
+
+                session
+                    .sendData_toPeers_withMode_error(ns_data.as_ref(), &peer_array, mode)
+                    .map_err(|e| e.to_string())
+            }
+        } else {
+            Err("Session not initialized".to_string())
+        }
+    }
+
+    pub fn connected_peers(&self) -> Vec<Retained<MCPeerID>> {
+        // Changed return type
+        if let Some(session) = &self.session {
+            unsafe {
+                let peer_array = session.connectedPeers();
+                let count = peer_array.count();
+                let mut peers = Vec::with_capacity(count as usize);
+
+                for i in 0..count {
+                    let peer = peer_array.objectAtIndex(i);
+                    peers.push(peer); // Just store the Retained<MCPeerID> directly
+                }
+                peers
+            }
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+// Add this after the MultipeerSession struct but before its impl
+
+pub struct SessionDelegate {
+    on_data_received: Option<Box<dyn Fn(&NSData, &MCPeerID)>>,
+    on_peer_joined: Option<Box<dyn Fn(&MCPeerID)>>,
+    on_peer_left: Option<Box<dyn Fn(&MCPeerID)>>,
+}
+
+impl SessionDelegate {
+    fn new(
+        on_data: Option<Box<dyn Fn(&NSData, &MCPeerID)>>,
+        on_joined: Option<Box<dyn Fn(&MCPeerID)>>,
+        on_left: Option<Box<dyn Fn(&MCPeerID)>>,
+    ) -> Self {
+        Self {
+            on_data_received: on_data,
+            on_peer_joined: on_joined,
+            on_peer_left: on_left,
+        }
+    }
+}
+
+unsafe impl RefEncode for SessionDelegate {
+    const ENCODING_REF: Encoding = Encoding::Object;
+}
+
+unsafe impl Message for SessionDelegate {}
+unsafe impl NSObjectProtocol for SessionDelegate {}
+
+unsafe impl MCSessionDelegate for SessionDelegate {
+    unsafe fn session_peer_didChangeState(
+        &self,
+        _session: &MCSession,
+        peer_id: &MCPeerID,
+        state: MCSessionState,
+    ) {
+        let _pool = unsafe { NSAutoreleasePool::new() };
+        match state {
+            MCSessionState::Connected => {
+                if let Some(cb) = &self.on_peer_joined {
+                    cb(peer_id);
+                }
+            }
+            MCSessionState::NotConnected => {
+                if let Some(cb) = &self.on_peer_left {
+                    cb(peer_id);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    unsafe fn session_didReceiveData_fromPeer(
+        &self,
+        _session: &MCSession,
+        data: &NSData,
+        peer_id: &MCPeerID,
+    ) {
+        let _pool = unsafe { NSAutoreleasePool::new() };
+        if let Some(cb) = &self.on_data_received {
+            cb(data, peer_id);
+        }
+    }
+
+    unsafe fn session_didReceiveStream_withName_fromPeer(
+        &self,
+        _session: &MCSession,
+        _stream: &NSInputStream,
+        _stream_name: &NSString,
+        _peer_id: &MCPeerID,
+    ) {
+        let _pool = unsafe { NSAutoreleasePool::new() };
+    }
+
+    unsafe fn session_didStartReceivingResourceWithName_fromPeer_withProgress(
+        &self,
+        _session: &MCSession,
+        _resource_name: &NSString,
+        _peer_id: &MCPeerID,
+        _progress: &NSProgress,
+    ) {
+        let _pool = unsafe { NSAutoreleasePool::new() };
+    }
+
+    unsafe fn session_didFinishReceivingResourceWithName_fromPeer_atURL_withError(
+        &self,
+        _session: &MCSession,
+        _resource_name: &NSString,
+        _peer_id: &MCPeerID,
+        _location_url: Option<&NSURL>,
+        _error: Option<&NSError>,
+    ) {
+        let _pool = unsafe { NSAutoreleasePool::new() };
+    }
+}

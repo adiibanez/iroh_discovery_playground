@@ -1,14 +1,3 @@
-#![allow(unused_imports)]
-#![allow(dead_code)]
-#![allow(unused_variables)]
-// #![allow(deprecated)]
-// #![allow(unused_must_use)]
-#![allow(non_local_definitions)]
-// #[cfg(not(clippy))]
-#![feature(mpmc_channel)]
-#![allow(clippy::too_many_arguments)]
-#![allow(unused_unsafe)]
-
 use objc2::rc::Allocated;
 use objc2::{Encoding, Message, RefEncode};
 use objc2::{MainThreadMarker, class, msg_send, rc::Retained, sel};
@@ -97,7 +86,7 @@ impl MultipeerTransport {
 
             let service_type = NSString::from_str(&formatted_type);
 
-            let mainthread_marker = unsafe { MainThreadMarker::new_unchecked() };
+            let mainthread_marker = MainThreadMarker::new_unchecked();
 
             // Initialize browser with proper parameters
             let browser = MCBrowserViewController::initWithServiceType_session(
@@ -194,18 +183,18 @@ impl MultipeerTransport {
 
 #[derive(Debug)]
 pub struct SessionDelegate {
-    _marker: PhantomData<*const ()>, // Add marker to prevent Send/Sync
+    _marker: PhantomData<MainThreadMarker>, // Changed from dyn MainThreadOnly
 }
 
 impl SessionDelegate {
-    fn new() -> Self {
+    fn new(_mtm: MainThreadMarker) -> Self {
+        // We take mtm to verify we're on main thread
         debug!("Creating new SessionDelegate");
         Self {
             _marker: PhantomData,
         }
     }
 }
-
 unsafe impl RefEncode for SessionDelegate {
     const ENCODING_REF: Encoding = Encoding::Object;
 }
@@ -219,104 +208,38 @@ impl MultipeerTransport {
         debug!("Entering establish_connection");
         unsafe {
             let _pool = NSAutoreleasePool::new();
+            let mtm = MainThreadMarker::new().expect("Must be on main thread");
 
             debug!("Creating MCSession");
             let session = MCSession::initWithPeer(MCSession::alloc(), self.peer_id.as_ref());
 
             debug!("Creating delegate");
             let delegate_object = {
-                // Create delegate with marker first
-                let delegate = SessionDelegate::new();
+                // Create and box the delegate
+                let delegate = SessionDelegate::new(mtm);
                 debug!("Created delegate struct: {:?}", delegate);
 
-                // Box and get raw pointer, asserting it's valid
-                let boxed = Box::into_raw(Box::new(delegate));
-                // let boxed = Box::new(delegate);
-                // assert_ne!(boxed as usize, 0x1, "Invalid box pointer");
-                // assert_ne!(boxed as usize, 0x0, "Null box pointer");
-                debug!("Delegate boxed ptr: {:p}", boxed);
+                // Convert to raw pointer
+                let boxed = Box::new(delegate);
+                let raw_ptr = Box::into_raw(boxed);
+                debug!("Created delegate ptr: {:p}", raw_ptr);
 
-                // Create retained object and validate pointer
-                let retained = match Retained::from_raw(boxed) {
-                    // let retained = match Retained::from(delegate) {
-                    Some(r) => {
-                        debug!(
-                            "Successfully retained delegate: {:p}",
-                            Retained::<SessionDelegate>::as_ptr(&r)
-                        );
-                        r
-                    }
-                    None => {
-                        let _ = Box::from_raw(boxed);
-                        panic!("Failed to retain delegate");
-                    }
-                };
+                // Create retained object from raw pointer
+                let initial_retained =
+                    Retained::from_raw(raw_ptr).expect("Failed to create initial retained object");
+                debug!("Created initial retained object");
 
-                // Create protocol object
-                let proto_obj = ProtocolObject::from_retained(retained);
+                // Create protocol object from retained
+                let proto = ProtocolObject::from_retained(initial_retained);
                 debug!("Created protocol object");
 
                 // Store immediately
-                self.delegate = Some(proto_obj.clone());
-                debug!("Stored delegate");
-
-                proto_obj
+                self.delegate = Some(proto.clone());
+                proto
             };
 
             debug!("Setting delegate");
             session.setDelegate(Some(&delegate_object));
-
-            debug!("Storing session");
-            self.session = Some(session);
-        }
-    }
-
-    pub fn _establish_connection(&mut self) {
-        debug!("Entering establish_connection");
-        unsafe {
-            let _pool = NSAutoreleasePool::new();
-
-            debug!("Creating MCSession");
-            let session = MCSession::initWithPeer(MCSession::alloc(), self.peer_id.as_ref());
-
-            debug!("Creating delegate");
-            let delegate_object = {
-                // Create delegate with marker
-                let delegate = SessionDelegate {
-                    _marker: PhantomData,
-                };
-                debug!("Created delegate struct");
-
-                // Box and get raw pointer in one step
-                let boxed = Box::into_raw(Box::new(delegate));
-                debug!("Delegate boxed ptr: {:p}", boxed);
-
-                // First create retained object from raw pointer
-                let retained = match Retained::from_raw(boxed) {
-                    Some(r) => {
-                        debug!("Successfully retained delegate");
-                        r
-                    }
-                    None => {
-                        // Clean up if retain failed
-                        let _ = Box::from_raw(boxed);
-                        panic!("Failed to retain delegate");
-                    }
-                };
-
-                // Convert to protocol object
-                let proto_obj = ProtocolObject::from_retained(retained);
-                debug!("Created protocol object");
-
-                // Store clone before returning
-                self.delegate = Some(proto_obj.clone());
-                proto_obj
-            };
-
-            debug!("Setting delegate");
-            session.setDelegate(Some(&delegate_object));
-
-            debug!("Storing session");
             self.session = Some(session);
         }
     }
@@ -330,7 +253,7 @@ unsafe impl MCSessionDelegate for SessionDelegate {
         state: MCSessionState,
     ) {
         debug!("session_peer_didChangeState called on {:p}", self);
-        let _pool = unsafe { NSAutoreleasePool::new() };
+        let _pool = NSAutoreleasePool::new();
         debug!("Peer {:?} state changed to {:?}", peer_id, state);
     }
 
@@ -340,7 +263,7 @@ unsafe impl MCSessionDelegate for SessionDelegate {
         data: &NSData,
         peer_id: &MCPeerID,
     ) {
-        let _pool = unsafe { NSAutoreleasePool::new() };
+        let _pool = NSAutoreleasePool::new();
         debug!("Received data from peer: {:?}", peer_id);
     }
 
@@ -352,7 +275,7 @@ unsafe impl MCSessionDelegate for SessionDelegate {
         _stream_name: &NSString,
         _peer_id: &MCPeerID,
     ) {
-        let _pool = unsafe { NSAutoreleasePool::new() };
+        let _pool = NSAutoreleasePool::new();
         debug!("Received stream from peer");
     }
 
@@ -363,7 +286,7 @@ unsafe impl MCSessionDelegate for SessionDelegate {
         _peer_id: &MCPeerID,
         _progress: &NSProgress,
     ) {
-        let _pool = unsafe { NSAutoreleasePool::new() };
+        let _pool = NSAutoreleasePool::new();
         debug!("Started receiving resource");
     }
 
@@ -375,7 +298,7 @@ unsafe impl MCSessionDelegate for SessionDelegate {
         _local_url: Option<&NSURL>,
         _error: Option<&NSError>,
     ) {
-        let _pool = unsafe { NSAutoreleasePool::new() };
+        let _pool = NSAutoreleasePool::new();
         debug!("Finished receiving resource");
     }
 }
