@@ -1,6 +1,6 @@
 #![allow(unused_unsafe)]
 use objc2::rc::Allocated;
-use objc2::{Encoding, Message, RefEncode};
+use objc2::{Encoding, Message, RefEncode, exception};
 use objc2::{MainThreadMarker, class, msg_send, rc::Retained, sel};
 use objc2_foundation::{NSAutoreleasePool, NSData, NSError, NSURL};
 use objc2_foundation::{NSInputStream, NSObjectProtocol};
@@ -63,12 +63,12 @@ impl fmt::Debug for MultipeerSession {
 impl MultipeerSession {
     pub fn new(
         service_name: &str,
-        on_data: impl Fn(&NSData, &MCPeerID) + 'static,
-        on_joined: impl Fn(&MCPeerID) + 'static,
-        on_left: impl Fn(&MCPeerID) + 'static,
+        on_data: impl Fn(&NSData, &MCPeerID) + 'static + std::panic::UnwindSafe,
+        on_joined: impl Fn(&MCPeerID) + 'static + std::panic::UnwindSafe,
+        on_left: impl Fn(&MCPeerID) + 'static + std::panic::UnwindSafe,
     ) -> Self {
-        unsafe {
-            let _pool = unsafe { NSAutoreleasePool::new() };
+        exception::catch(|| unsafe {
+            let _pool = NSAutoreleasePool::new();
 
             // Format service name
             let formatted_name = format!("iroh-{}", service_name)
@@ -79,8 +79,8 @@ impl MultipeerSession {
 
             let service_type = NSString::from_str(&formatted_name);
 
-            // Create peer ID from device name
-            let device_name = NSString::from_str("rust-peer"); // TODO: Get actual device name
+            // Create peer ID with proper memory management
+            let device_name = NSString::from_str("rust-peer");
             let peer_id = MCPeerID::initWithDisplayName(MCPeerID::alloc(), &device_name);
 
             let mut session = Self {
@@ -95,60 +95,61 @@ impl MultipeerSession {
                 on_data_received: Some(Box::new(on_data)),
             };
 
-            // Initialize session
             session.initialize();
             session
-        }
+        })
+        .expect("Failed to initialize MultipeerSession")
     }
 
     fn initialize(&mut self) {
-        unsafe {
-            let _pool = unsafe { NSAutoreleasePool::new() };
+        // First create all objects outside the catch boundary
+        let (session, advertiser, browser, delegate) = unsafe {
+            let _pool = NSAutoreleasePool::new();
 
             // Create MCSession
             let mc_session = MCSession::initWithPeer(MCSession::alloc(), self.peer_id.as_ref());
 
-            // Create and set delegate
-            let delegate = SessionDelegate::new(
+            // Create delegate
+            let delegate_impl = SessionDelegate::new(
                 self.on_data_received.take(),
                 self.on_peer_joined.take(),
                 self.on_peer_left.take(),
             );
 
-            let retained = {
-                // Box the delegate first
-                let boxed = Box::new(delegate);
-                // Convert to raw pointer
-                let raw_ptr = Box::into_raw(boxed);
-                // Create retained object from raw pointer
-                Retained::from_raw(raw_ptr).expect("Failed to retain delegate")
-            };
+            // Box and retain the delegate
+            let boxed = Box::new(delegate_impl);
+            let raw_ptr = Box::into_raw(boxed);
+            let retained = Retained::from_raw(raw_ptr).expect("Failed to retain delegate");
+            let delegate_obj = ProtocolObject::from_retained(retained);
 
-            let proto_obj = ProtocolObject::from_retained(retained);
+            // Set delegate on session
+            mc_session.setDelegate(Some(&delegate_obj));
 
-            mc_session.setDelegate(Some(&proto_obj));
-            self.delegate = Some(proto_obj);
-            self.session = Some(mc_session);
-
-            // Setup advertiser
-            let advertiser = MCNearbyServiceAdvertiser::initWithPeer_discoveryInfo_serviceType(
+            // Create advertiser
+            let adv = MCNearbyServiceAdvertiser::initWithPeer_discoveryInfo_serviceType(
                 MCNearbyServiceAdvertiser::alloc(),
                 self.peer_id.as_ref(),
                 None,
                 self.service_type.as_ref(),
             );
-            advertiser.startAdvertisingPeer();
-            self.service_advertiser = Some(advertiser);
+            adv.startAdvertisingPeer();
 
-            // Setup browser
-            let browser = MCNearbyServiceBrowser::initWithPeer_serviceType(
+            // Create browser
+            let br = MCNearbyServiceBrowser::initWithPeer_serviceType(
                 MCNearbyServiceBrowser::alloc(),
                 self.peer_id.as_ref(),
                 self.service_type.as_ref(),
             );
-            browser.startBrowsingForPeers();
-            self.service_browser = Some(browser);
-        }
+            br.startBrowsingForPeers();
+
+            (mc_session, adv, br, delegate_obj)
+        };
+
+        // Then update self outside the catch boundary
+        self.session = Some(session);
+        self.service_advertiser = Some(advertiser);
+        self.service_browser = Some(browser);
+        self.delegate = Some(delegate);
     }
 
     pub fn send_to_peers(
@@ -295,5 +296,26 @@ unsafe impl MCSessionDelegate for SessionDelegate {
         _error: Option<&NSError>,
     ) {
         let _pool = unsafe { NSAutoreleasePool::new() };
+    }
+}
+
+struct PoolDebug {
+    _pool: Retained<NSAutoreleasePool>, // Changed type to Retained<NSAutoreleasePool>
+    name: &'static str,
+}
+
+impl PoolDebug {
+    fn new(name: &'static str) -> Self {
+        debug!("Creating pool: {}", name);
+        Self {
+            _pool: unsafe { NSAutoreleasePool::new() },
+            name,
+        }
+    }
+}
+
+impl Drop for PoolDebug {
+    fn drop(&mut self) {
+        debug!("Dropping pool: {}", self.name);
     }
 }
