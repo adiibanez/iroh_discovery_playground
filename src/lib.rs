@@ -1,18 +1,14 @@
 #![allow(unused_imports)]
 #![allow(dead_code)]
 #![allow(unused_variables)]
-// #![allow(deprecated)]
-// #![allow(unused_must_use)]
 #![allow(non_local_definitions)]
-// #[cfg(not(clippy))]
-#![feature(mpmc_channel)]
 #![allow(clippy::too_many_arguments)]
 #![allow(unused_unsafe)]
 
 use objc2::rc::Allocated;
 use objc2::{Encoding, Message, RefEncode};
-use objc2::{MainThreadMarker, class, msg_send, rc::Retained, sel};
-use objc2_foundation::{NSAutoreleasePool, NSData, NSError, NSURL};
+use objc2::{MainThreadMarker, class, define_class, msg_send, rc::Retained, sel};
+use objc2_foundation::{NSAutoreleasePool, NSData, NSError, NSObject, NSURL};
 use objc2_foundation::{NSInputStream, NSObjectProtocol};
 use objc2_foundation::{NSProgress, NSString};
 use objc2_multipeer_connectivity::MCSessionDelegate;
@@ -22,26 +18,119 @@ use objc2_multipeer_connectivity::{
     MCAdvertiserAssistant, MCBrowserViewController, MCPeerID, MCSession,
 };
 
+use objc2::AllocAnyThread;
+use objc2::DefinedClass;
+use objc2::MainThreadOnly;
 use objc2::runtime::ProtocolObject;
 use objc2::runtime::{AnyClass, AnyObject};
-// use objc2::{Encoding, Message, RefEncode, class};
 
-use objc2::AllocAnyThread;
-use objc2::MainThreadOnly;
-
+use std::cell::{Cell, RefCell};
+use std::fmt;
 use std::marker::PhantomData;
+use std::ptr;
 use std::sync::{Arc, RwLock};
 
 use log::{debug, error, info, trace, warn};
 
+// Define state for our delegate
+pub struct SessionDelegateState {
+    transport: *mut MultipeerTransport,
+}
+
+// Use define_class! macro to create our delegate class
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[name = "IrohSessionDelegate"]
+    #[ivars = SessionDelegateState]
+    pub struct SessionDelegate;
+
+    unsafe impl NSObjectProtocol for SessionDelegate {}
+
+    unsafe impl MCSessionDelegate for SessionDelegate {
+        #[unsafe(method(session:peer:didChangeState:))]
+        fn session_peer_didChangeState(
+            &self,
+            session: &MCSession,
+            peer_id: &MCPeerID,
+            state: MCSessionState,
+        ) {
+            debug!("Peer {:?} state changed to {:?}", peer_id, state);
+
+            // Access transport if needed
+            let transport_ptr = self.ivars().transport;
+            if !transport_ptr.is_null() {
+                let transport = unsafe { &mut *transport_ptr };
+                debug!("Transport reference available in didChangeState");
+            }
+        }
+
+        #[unsafe(method(session:didReceiveData:fromPeer:))]
+        fn session_didReceiveData_fromPeer(
+            &self,
+            session: &MCSession,
+            data: &NSData,
+            peer_id: &MCPeerID,
+        ) {
+            debug!("Received data from peer: {:?}", peer_id);
+
+            // Process received data
+            let transport_ptr = self.ivars().transport;
+            if !transport_ptr.is_null() {
+                let transport = unsafe { &mut *transport_ptr };
+                // Handle received data with transport
+            }
+        }
+
+        #[unsafe(method(session:didReceiveStream:withName:fromPeer:))]
+        fn session_didReceiveStream_withName_fromPeer(
+            &self,
+            session: &MCSession,
+            stream: &NSInputStream,
+            stream_name: &NSString,
+            peer_id: &MCPeerID,
+        ) {
+            debug!("Received stream from peer");
+        }
+
+        #[unsafe(method(session:didStartReceivingResourceWithName:fromPeer:withProgress:))]
+        fn session_didStartReceivingResourceWithName_fromPeer_withProgress(
+            &self,
+            session: &MCSession,
+            resource_name: &NSString,
+            peer_id: &MCPeerID,
+            progress: &NSProgress,
+        ) {
+            debug!("Started receiving resource");
+        }
+
+        #[unsafe(method(session:didFinishReceivingResourceWithName:fromPeer:atURL:withError:))]
+        fn session_didFinishReceivingResourceWithName_fromPeer_atURL_withError(
+            &self,
+            session: &MCSession,
+            resource_name: &NSString,
+            peer_id: &MCPeerID,
+            local_url: Option<&NSURL>,
+            error: Option<&NSError>,
+        ) {
+            debug!("Finished receiving resource");
+        }
+    }
+);
+
+// Manual Debug implementation for SessionDelegate
+impl fmt::Debug for SessionDelegate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("SessionDelegate").finish()
+    }
+}
+
 #[derive(Debug)]
 pub struct MultipeerTransport {
-    pub peer_id: Retained<MCPeerID>, // Changed from MCPeerID to Retained<MCPeerID>
-    pub session: Option<Retained<MCSession>>, // Communication session with peers
-    pub advertiser: Option<Retained<MCAdvertiserAssistant>>, // Advertise to nearby peers
-    pub browser: Option<Retained<MCBrowserViewController>>, // Browse for available peers
-    // delegate: ProtocolObject<dyn MCSessionDelegate>, // Changed to Retained
-    pub delegate: Option<Retained<ProtocolObject<dyn MCSessionDelegate>>>,
+    pub peer_id: Retained<MCPeerID>,
+    pub session: Option<Retained<MCSession>>,
+    pub advertiser: Option<Retained<MCAdvertiserAssistant>>,
+    pub browser: Option<Retained<MCBrowserViewController>>,
+    pub delegate: Option<Retained<SessionDelegate>>,
 }
 
 impl MultipeerTransport {
@@ -55,9 +144,7 @@ impl MultipeerTransport {
             delegate: None,
         }
     }
-}
 
-impl MultipeerTransport {
     // Start advertising this peer to nearby devices
     pub fn start_advertising(&mut self, service_type: &str) {
         unsafe {
@@ -71,18 +158,23 @@ impl MultipeerTransport {
 
             let service_type = NSString::from_str(&formatted_type);
 
-            // Initialize advertiser with proper parameters
-            let advertiser = MCAdvertiserAssistant::initWithServiceType_discoveryInfo_session(
-                MCAdvertiserAssistant::alloc(),
-                &service_type,
-                None, // No discovery info
-                self.session.as_ref().unwrap().as_ref(),
-            );
+            // Ensure session exists
+            if let Some(session) = &self.session {
+                // Initialize advertiser with proper parameters
+                let advertiser = MCAdvertiserAssistant::initWithServiceType_discoveryInfo_session(
+                    MCAdvertiserAssistant::alloc(),
+                    &service_type,
+                    None, // No discovery info
+                    session.as_ref(),
+                );
 
-            self.advertiser = Some(advertiser);
+                self.advertiser = Some(advertiser);
 
-            // Start advertising
-            let _: () = msg_send![self.advertiser.as_ref().unwrap(), start];
+                // Start advertising
+                let _: () = msg_send![self.advertiser.as_ref().unwrap(), start];
+            } else {
+                debug!("Cannot start advertising: session not established");
+            }
         }
     }
 
@@ -97,85 +189,67 @@ impl MultipeerTransport {
 
             let service_type = NSString::from_str(&formatted_type);
 
-            let mainthread_marker = unsafe { MainThreadMarker::new_unchecked() };
+            // Ensure session exists
+            if let Some(session) = &self.session {
+                let mainthread_marker = MainThreadMarker::new_unchecked();
 
-            // Initialize browser with proper parameters
-            let browser = MCBrowserViewController::initWithServiceType_session(
-                MCBrowserViewController::alloc(mainthread_marker),
-                &service_type,
-                self.session.as_ref().unwrap().as_ref(),
-            );
+                // Initialize browser with proper parameters
+                let browser = MCBrowserViewController::initWithServiceType_session(
+                    MCBrowserViewController::alloc(mainthread_marker),
+                    &service_type,
+                    session.as_ref(),
+                );
 
-            // We need to set minimum and maximum number of peers
-            let _: () = msg_send![&browser,
-                setMinimumNumberOfPeers: 1_u64
-            ];
-            let _: () = msg_send![&browser,
-                setMaximumNumberOfPeers: 8_u64
-            ];
+                // We need to set minimum and maximum number of peers
+                let _: () = msg_send![&browser,
+                    setMinimumNumberOfPeers: 1_u64
+                ];
+                let _: () = msg_send![&browser,
+                    setMaximumNumberOfPeers: 8_u64
+                ];
 
-            self.browser = Some(browser);
-
-            // Note: Removed the start call since MCBrowserViewController
-            // is a UI component that presents itself
+                self.browser = Some(browser);
+            } else {
+                debug!("Cannot start browsing: session not established");
+            }
         }
     }
 
-    // pub fn establish_connection(&mut self) {
-    //     debug!("Entering establish_connection");
-    //     unsafe {
-    //         let _pool = NSAutoreleasePool::new();
+    pub fn establish_connection(&mut self) {
+        debug!("Entering establish_connection");
+        unsafe {
+            let _pool = NSAutoreleasePool::new();
 
-    //         debug!("Creating MCSession");
-    //         let session = {
-    //             let alloc = MCSession::alloc();
-    //             debug!(
-    //                 "MCSession alloc: {:p}",
-    //                 Allocated::<MCSession>::as_ptr(&alloc)
-    //             );
-    //             let session = MCSession::initWithPeer(alloc, self.peer_id.as_ref());
-    //             debug!(
-    //                 "MCSession init: {:p}",
-    //                 Retained::<MCSession>::as_ptr(&session)
-    //             );
-    //             session
-    //         };
+            debug!("Creating MCSession");
+            let session = MCSession::initWithPeer(MCSession::alloc(), self.peer_id.as_ref());
 
-    //         debug!("Creating delegate");
-    //         let delegate_object = {
-    //             let delegate = SessionDelegate {};
-    //             let delegate_box = Box::new(delegate);
-    //             let delegate_ptr = Box::into_raw(delegate_box);
-    //             debug!("Delegate ptr: {:p}", delegate_ptr);
+            debug!("Creating delegate");
+            // Create our delegate instance and set the transport pointer
+            let delegate = SessionDelegate::alloc().set_ivars(SessionDelegateState {
+                transport: self as *mut _,
+            });
+            let delegate: Retained<SessionDelegate> = msg_send![super(delegate), init];
 
-    //             let retained = Retained::from_raw(delegate_ptr).expect("Failed to retain delegate");
-    //             debug!(
-    //                 "Retained delegate: {:p}",
-    //                 Retained::<SessionDelegate>::as_ptr(&retained)
-    //             );
+            debug!("Setting delegate on session");
 
-    //             ProtocolObject::from_retained(retained)
-    //         };
-    //         debug!(
-    //             "Protocol object: {:p}",
-    //             Retained::<ProtocolObject<_>>::as_ptr(&delegate_object)
-    //         );
+            // Use objc_msgSend directly to set the delegate
+            // This bypasses Rust's type system and lets the Objective-C runtime handle the protocol conversion
+            unsafe {
+                let _: () = msg_send![session, setDelegate: delegate.as_ref()];
+            }
 
-    //         debug!("Setting delegate");
-    //         session.setDelegate(Some(&delegate_object));
-
-    //         debug!("Storing session and delegate");
-    //         self.session = Some(session);
-    //         self.delegate = Some(delegate_object);
-    //     }
-    // }
+            debug!("Storing session and delegate");
+            self.session = Some(session);
+            self.delegate = Some(delegate);
+        }
+    }
 
     pub fn send_message(&self, message: &str) {
         if let Some(session) = &self.session {
             unsafe {
                 // Convert string to NSData
                 let message_str = NSString::from_str(message);
-                let message_data: Retained<NSData> = msg_send![&message_str,  // Added & here
+                let message_data: Retained<NSData> = msg_send![&message_str,
                     dataUsingEncoding: 4_u64  // NSUTF8StringEncoding = 4 as u64
                 ];
 
@@ -188,194 +262,8 @@ impl MultipeerTransport {
                     MCSessionSendDataMode::Reliable,
                 );
             }
+        } else {
+            debug!("Cannot send message: session not established");
         }
-    }
-}
-
-#[derive(Debug)]
-pub struct SessionDelegate {
-    _marker: PhantomData<*const ()>, // Add marker to prevent Send/Sync
-}
-
-impl SessionDelegate {
-    fn new() -> Self {
-        debug!("Creating new SessionDelegate");
-        Self {
-            _marker: PhantomData,
-        }
-    }
-}
-
-unsafe impl RefEncode for SessionDelegate {
-    const ENCODING_REF: Encoding = Encoding::Object;
-}
-
-unsafe impl Message for SessionDelegate {}
-unsafe impl NSObjectProtocol for SessionDelegate {}
-
-// Update establish_connection
-impl MultipeerTransport {
-    pub fn establish_connection(&mut self) {
-        debug!("Entering establish_connection");
-        unsafe {
-            let _pool = NSAutoreleasePool::new();
-
-            debug!("Creating MCSession");
-            let session = MCSession::initWithPeer(MCSession::alloc(), self.peer_id.as_ref());
-
-            debug!("Creating delegate");
-            let delegate_object = {
-                // Create delegate with marker first
-                let delegate = SessionDelegate::new();
-                debug!("Created delegate struct: {:?}", delegate);
-
-                // Box and get raw pointer, asserting it's valid
-                let boxed = Box::into_raw(Box::new(delegate));
-                // let boxed = Box::new(delegate);
-                // assert_ne!(boxed as usize, 0x1, "Invalid box pointer");
-                // assert_ne!(boxed as usize, 0x0, "Null box pointer");
-                debug!("Delegate boxed ptr: {:p}", boxed);
-
-                // Create retained object and validate pointer
-                let retained = match Retained::from_raw(boxed) {
-                    // let retained = match Retained::from(delegate) {
-                    Some(r) => {
-                        debug!(
-                            "Successfully retained delegate: {:p}",
-                            Retained::<SessionDelegate>::as_ptr(&r)
-                        );
-                        r
-                    }
-                    None => {
-                        let _ = Box::from_raw(boxed);
-                        panic!("Failed to retain delegate");
-                    }
-                };
-
-                // Create protocol object
-                let proto_obj = ProtocolObject::from_retained(retained);
-                debug!("Created protocol object");
-
-                // Store immediately
-                self.delegate = Some(proto_obj.clone());
-                debug!("Stored delegate");
-
-                proto_obj
-            };
-
-            debug!("Setting delegate");
-            session.setDelegate(Some(&delegate_object));
-
-            debug!("Storing session");
-            self.session = Some(session);
-        }
-    }
-
-    pub fn _establish_connection(&mut self) {
-        debug!("Entering establish_connection");
-        unsafe {
-            let _pool = NSAutoreleasePool::new();
-
-            debug!("Creating MCSession");
-            let session = MCSession::initWithPeer(MCSession::alloc(), self.peer_id.as_ref());
-
-            debug!("Creating delegate");
-            let delegate_object = {
-                // Create delegate with marker
-                let delegate = SessionDelegate {
-                    _marker: PhantomData,
-                };
-                debug!("Created delegate struct");
-
-                // Box and get raw pointer in one step
-                let boxed = Box::into_raw(Box::new(delegate));
-                debug!("Delegate boxed ptr: {:p}", boxed);
-
-                // First create retained object from raw pointer
-                let retained = match Retained::from_raw(boxed) {
-                    Some(r) => {
-                        debug!("Successfully retained delegate");
-                        r
-                    }
-                    None => {
-                        // Clean up if retain failed
-                        let _ = Box::from_raw(boxed);
-                        panic!("Failed to retain delegate");
-                    }
-                };
-
-                // Convert to protocol object
-                let proto_obj = ProtocolObject::from_retained(retained);
-                debug!("Created protocol object");
-
-                // Store clone before returning
-                self.delegate = Some(proto_obj.clone());
-                proto_obj
-            };
-
-            debug!("Setting delegate");
-            session.setDelegate(Some(&delegate_object));
-
-            debug!("Storing session");
-            self.session = Some(session);
-        }
-    }
-}
-
-unsafe impl MCSessionDelegate for SessionDelegate {
-    unsafe fn session_peer_didChangeState(
-        &self,
-        session: &MCSession,
-        peer_id: &MCPeerID,
-        state: MCSessionState,
-    ) {
-        debug!("session_peer_didChangeState called on {:p}", self);
-        let _pool = unsafe { NSAutoreleasePool::new() };
-        debug!("Peer {:?} state changed to {:?}", peer_id, state);
-    }
-
-    unsafe fn session_didReceiveData_fromPeer(
-        &self,
-        _session: &MCSession,
-        data: &NSData,
-        peer_id: &MCPeerID,
-    ) {
-        let _pool = unsafe { NSAutoreleasePool::new() };
-        debug!("Received data from peer: {:?}", peer_id);
-    }
-
-    // Add missing required methods
-    unsafe fn session_didReceiveStream_withName_fromPeer(
-        &self,
-        _session: &MCSession,
-        _stream: &NSInputStream,
-        _stream_name: &NSString,
-        _peer_id: &MCPeerID,
-    ) {
-        let _pool = unsafe { NSAutoreleasePool::new() };
-        debug!("Received stream from peer");
-    }
-
-    unsafe fn session_didStartReceivingResourceWithName_fromPeer_withProgress(
-        &self,
-        _session: &MCSession,
-        _resource_name: &NSString,
-        _peer_id: &MCPeerID,
-        _progress: &NSProgress,
-    ) {
-        let _pool = unsafe { NSAutoreleasePool::new() };
-        debug!("Started receiving resource");
-    }
-
-    unsafe fn session_didFinishReceivingResourceWithName_fromPeer_atURL_withError(
-        &self,
-        _session: &MCSession,
-        _resource_name: &NSString,
-        _peer_id: &MCPeerID,
-        _local_url: Option<&NSURL>,
-        _error: Option<&NSError>,
-    ) {
-        let _pool = unsafe { NSAutoreleasePool::new() };
-        debug!("Finished receiving resource");
     }
 }
